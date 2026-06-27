@@ -54,7 +54,20 @@ def _resolve_device(device: str | None) -> torch.device | None:
     return torch.device(device)
 
 
-class LanceDROIDDataset(DROIDLeRobotDataset):
+class _FreeBaseRowsMixin:
+    """Free ``ActionBaseDataset._rows`` — the per-frame Python-dict list the base
+    materializes in ``__init__`` (one dict per frame; ~tens of GB at full DROID's ~18M
+    frames per the base's own comment). The DROID loaders read windows from the compact
+    numpy arrays via ``_window_rows`` and override ``__len__``, so ``_rows`` is unused
+    dead weight here — and worse, with ``spawn`` workers (Lance is not fork-safe) it is
+    pickled to EVERY worker, multiplying the index footprint by ``num_workers``. Freeing
+    it cuts both the main-process and per-worker memory. Output is unchanged."""
+
+    def _free_base_rows(self) -> None:
+        self._rows = None
+
+
+class LanceDROIDDataset(_FreeBaseRowsMixin, DROIDLeRobotDataset):
     def __init__(
         self,
         root: str,
@@ -67,6 +80,7 @@ class LanceDROIDDataset(DROIDLeRobotDataset):
         **kwargs: Any,
     ) -> None:
         super().__init__(root=root, **kwargs)
+        self._free_base_rows()
         self._lance_uri = lance_uri
         self._frames_name = frames_table
         self._videos_name = f"{frames_table}_videos"
@@ -254,7 +268,7 @@ class LanceDROIDDataset(DROIDLeRobotDataset):
         return results
 
 
-class LanceDROIDComposedDataset(DROIDLeRobotDataset):
+class LanceDROIDComposedDataset(_FreeBaseRowsMixin, DROIDLeRobotDataset):
     """Fastest action loader: decodes a pre-composed, pre-resized, short-GOP
     per-episode clip (one stream) instead of 3 full views + resize + concat.
 
@@ -277,6 +291,7 @@ class LanceDROIDComposedDataset(DROIDLeRobotDataset):
         **kwargs: Any,
     ) -> None:
         super().__init__(root=root, **kwargs)
+        self._free_base_rows()
         self._lance_uri = lance_uri
         self._table = table
         self._decode_device = _resolve_device(decode_device)

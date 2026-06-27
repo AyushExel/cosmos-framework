@@ -41,28 +41,34 @@ import bench_combined_faithful as C  # reuse the exact sub-loader builders + Inf
 
 _D = "/home/ubuntu/work/data"
 _S = "s3://lancedb-datasets-dev-us-east-2-devrel/cosmos"
-_FUSE = "/home/ubuntu/s3mnt/cosmos"
 _BUCKET = "lancedb-datasets-dev-us-east-2-devrel"
 _JSONL = f"{_D}/bridge_src/sft_dataset_bridge/train/video_dataset_file.jsonl"
+_VLM_HF = "figureqa(cauldron,llava_format)"
+_VSFT_PREFIX = "cosmos/vision_sft/base/sft_dataset_bridge/train"
+_ACTION_PREFIX = "cosmos/droid327/base/success"
 
 
 def _paths(regime, trio):
-    """(paths-dict, region, vsft_s3_bucket, vsft_s3_prefix, vlm_hf_subset) for a regime."""
+    """(paths, region, action_s3_bucket, action_s3_prefix, vsft_s3_bucket, vsft_s3_prefix, vlm_hf) per regime.
+
+    The VLM base is HF-Hub streaming in every regime (cosmos has no local/S3 VLM base),
+    so vlm_hf is always set. action_root is always the LOCAL DROID root (parquet/meta
+    index); for S3 the base materializes the mega-mp4s from action_s3_bucket/prefix."""
     if regime == "local":
         return (dict(action_root=f"{_D}/droid327/success", action_uri=f"{_D}/lance/droid_composed327_plain",
-                     vlm_wds=f"{_D}/wds/llava_figureqa/shard-{{00000..00019}}.tar", vlm_uri=f"{_D}/lance/llava_figureqa",
+                     vlm_uri=f"{_D}/lance/llava_figureqa",
                      vsft_jsonl=_JSONL, vsft_uri=f"{_D}/lance/vision_sft_plain"),
-                None, None, None, None)
+                None, None, None, None, None, _VLM_HF)
     if regime == "s3":
-        return (dict(action_root=f"{_FUSE}/droid327/base/success", action_uri=f"{_S}/droid327/lance/droid_composed327_plain",
-                     vlm_wds=f"{_FUSE}/llava/wds/shard-{{00000..00019}}.tar", vlm_uri=f"{_S}/llava/lance/llava_figureqa",
+        return (dict(action_root=f"{_D}/droid327/success", action_uri=f"{_S}/droid327/lance/droid_composed327_plain",
+                     vlm_uri=f"{_S}/llava/lance/llava_figureqa",
                      vsft_jsonl=_JSONL, vsft_uri=f"{_S}/vision_sft/lance/vision_sft_plain"),
-                "us-east-2", _BUCKET, "cosmos/vision_sft/base/sft_dataset_bridge/train", None)
-    # mixed: action local, vsft S3, VLM HF-stream(base)/S3(lance)
+                "us-east-2", _BUCKET, _ACTION_PREFIX, _BUCKET, _VSFT_PREFIX, _VLM_HF)
+    # mixed: action local, vsft S3, VLM HF-stream(base)/S3(lance) — cosmos's realistic default
     return (dict(action_root=f"{_D}/droid327/success", action_uri=f"{_D}/lance/droid_composed327_plain",
-                 vlm_wds=f"{_D}/wds/llava_figureqa/shard-{{00000..00019}}.tar", vlm_uri=f"{_S}/llava/lance/llava_figureqa",
+                 vlm_uri=f"{_S}/llava/lance/llava_figureqa",
                  vsft_jsonl=_JSONL, vsft_uri=f"{_S}/vision_sft/lance/vision_sft_plain"),
-            "us-east-2", _BUCKET, "cosmos/vision_sft/base/sft_dataset_bridge/train", "figureqa(cauldron,llava_format)")
+            "us-east-2", None, None, _BUCKET, _VSFT_PREFIX, _VLM_HF)
 
 
 class PackedTransformer(nn.Module):
@@ -100,17 +106,19 @@ def main():
     args = ap.parse_args()
 
     dev = torch.device("cuda")
-    paths, region, vb, vp, vhf = _paths(args.regime, args.trio)
+    paths, region, ab, ap_, vb, vp, vhf = _paths(args.regime, args.trio)
     ratios = [int(x) for x in args.ratios.split(",")]
     which = args.trio
 
     a = C.build_action_loader(which, paths["action_root"], paths["action_uri"], region, args.cache_size,
-                              args.batch_size, args.action_workers)
-    v = C.build_vlm_loader(which, paths["vlm_wds"], paths["vlm_uri"], region, args.batch_size, args.vlm_workers,
-                           hf_subset=vhf if which == "base" else None)
+                              args.batch_size, args.action_workers,
+                              s3_bucket=ab if which == "base" else None,
+                              s3_prefix=ap_ if which == "base" else None)
+    v = C.build_vlm_loader(which, paths["vlm_uri"], region, args.batch_size, args.vlm_workers, vhf)
     vsft_n = (args.steps + args.warmup + 8) * args.batch_size
     s = C.build_vsft_loader(which, paths["vsft_jsonl"], paths["vsft_uri"], region, args.batch_size,
-                            args.vsft_workers, vsft_n, vb, vp)
+                            args.vsft_workers, vsft_n,
+                            vb if which == "base" else None, vp if which == "base" else None)
     loaders = [C._InfiniteLoader(a, "action"), C._InfiniteLoader(v, "vlm"), C._InfiniteLoader(s, "vsft")]
 
     # ratio-weighted round-robin selection (mirrors IterativeJointDataLoader modality pick)
