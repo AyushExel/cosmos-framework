@@ -1,216 +1,163 @@
 # Benchmarks — LanceDB vs base Cosmos dataloaders
 
-All numbers from a single node (48 CPU + NVIDIA L40S), 327 DROID episodes, batch 16, **CPU decode on
-both sides** (the base can only decode on CPU), RAW (no model) unless a row says otherwise. Lance tables
-use **plain `large_binary`** storage (the loaders auto-detect; see [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md) §4a).
-Mechanisms behind every win: [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md). Reproduce: §"Reproduce" below + [`REPRODUCE.md`](REPRODUCE.md).
+Single node (48 CPU + NVIDIA L40S), 327 DROID episodes, batch 16, **CPU decode on both
+sides** (the base can only decode on CPU), RAW (no model) unless a row says otherwise. Lance
+tables use **plain `large_binary`** storage. Every base side is the **genuine shipped loader**
+(see §6); mechanisms in [`HOW_IT_WORKS.md`](HOW_IT_WORKS.md), code in [`WALKTHROUGH.md`](WALKTHROUGH.md),
+reproduce in [`REPRODUCE.md`](REPRODUCE.md).
 
-Three storage regimes:
-- **LOCAL** — all three loaders read local disk (the "pre-downloaded everything" workflow).
-- **full S3** — everything on S3 (base action/VLM via s3fs FUSE since they have no native S3 reader; base vsft via boto3).
-- **MIXED** — each loader on its *real default* storage: action LOCAL, vision-SFT S3, VLM HF-stream (base)/S3 (lance). This is how Cosmos actually reads (see §"Base loader storage").
+Two regimes:
+- **LOCAL** — all loaders read local disk (cosmos's "pre-download then train" workflow).
+- **S3** — Lance reads `s3://` natively; the base reaches S3 the only way it can: action via
+  `S3DROIDLeRobotDataset` (a benchmark standin that downloads the per-view mega-mp4s then runs
+  the genuine decode — see `benchmarks/lance/base_standins.py`), vision-SFT via the genuine
+  `SFTDataset`'s own per-sample boto3 download, VLM via HF-Hub streaming (its only mode).
+
+> **Fairness note.** Earlier revisions compared against reconstructions / an s3fs FUSE mount,
+> which *inflated* the S3 speedups. These numbers use the genuine base classes throughout, so
+> they are lower than (and supersede) prior drafts — and honest.
 
 ---
 
-## 1. Headline — combined 3-loader throughput (samples/s)
+## 1. Combined 3-loader throughput (samples/s)
 
-The combined 1:1:1 mixer is gated by the slowest loader. Read it under **three** framings:
+The 1:1:1 mixer is gated by the slowest loader. Workers are action/vlm/vsft per-loader.
 
-Worker columns are action/vlm/vsft (`num_workers` per sub-loader's DataLoader).
+| comparison | LOCAL | S3 |
+| ---------- | ----- | -- |
+| base 4/4/4 vs lance 4/4/4 (cosmos default workers) | 92.6 → 254.8 (**2.75×**) | 72.6 → 265.2 (**3.65×**) |
+| base 18/4/18 vs lance 18/4/18 (tuned workers) | 280.1 → 931.0 (**3.32×**) | 251.7 → 1240.7 (**4.93×**) |
+| **base 4/4/4 (as-shipped) vs lance 18/4/18 (tuned)** | **10.1×** | **17.1×** |
 
-| framing | base workers | lance workers | LOCAL | full S3 | MIXED |
-| ------- | ------------ | ------------- | ----- | ------- | ----- |
-| **A. same workers, cosmos default** | 4/4/4 | 4/4/4 | **2.85×** | **3.76×** | **3.79×** |
-| **B. same workers, tuned** | 18/4/18 | 18/4/18 | **4.61×** | **6.48×** | **5.46×** |
-| **C. Lance tuned vs Cosmos as-shipped** | 4/4/4 (flat-4, no auto-balance — what Cosmos ships) | 18/4/18 | **11.7×** | **19.0×** | **16.2×** |
-
-**Framing C is the real out-of-the-box delta**: Cosmos defaults to ~4 workers per loader and does *not*
-rebalance toward the bottleneck (its "multiplex" is ratio-based modality mixing, not worker allocation —
-see §4). So a user who adopts the Lance loaders *and* tunes workers sees **12–19×**. Framing B isolates the
-pure dataloader change (same workers); Framing A is the worst case (both untuned). All three are honest;
-quote the one that matches your question.
-
-### Full matrix (absolute samples/s)
-
-| regime | base 4/4/4 | lance 4/4/4 | base 18/4/18 | lance 18/4/18 |
-| ------ | ---------- | ----------- | ------------ | ------------- |
-| LOCAL  | 88.8 | 252.7 | 224.7 | 1035.6 |
-| full S3 | 67.4 | 253.4 | 197.3 | 1278.1 |
-| MIXED  | 69.0 | 261.5 | 205.1 | 1120.7 |
-
-Reproduce: `benchmarks/lance/run_matrix.sh` (each cell a separate `bench_combined_faithful.py --trios …`).
-Note full-S3 lance (1278) > LOCAL lance (1036) at optimal workers — S3 reads run on the async IO-thread
-pool, so they don't steal decode CPU the way local read syscalls + page-cache contention do.
+Two compounding wins: the **Lance loaders** and **per-loader worker rebalancing** (cosmos ships
+a flat ~4 workers/loader and never rebalances toward the bottleneck — its "multiplex" is
+ratio-based modality mixing, not worker allocation). The bottom row is the real out-of-the-box
+delta. Reproduce: `benchmarks/lance/run_matrix.sh` (each cell a separate
+`bench_combined_faithful.py --trios …`). Full-S3 lance (1240.7) > LOCAL lance (931.0) at tuned
+workers because S3 reads run on the async IO-thread pool and don't steal decode CPU.
 
 ---
 
 ## 2. Single-loader (per-modality) throughput
 
-Most shipped recipes are single-modality (`action_policy_droid`, `llava_ov`, `vision_sft_nano`), so the
-per-loader numbers matter standalone. base → lance (speedup), same run as the matrix.
+base → lance (speedup), 18 workers for action/vsft, 4 for VLM.
 
-**At the optimal allocation (action/vsft 18 workers, VLM 4):**
+| loader (recipe) | LOCAL | S3 |
+| --------------- | ----- | -- |
+| action / DROID (`action_policy_droid`), episode-shuffle | 172.4 → 304.9 (**1.77×**) | 152.6 → 295.7 (**1.94×**) |
+| vision-SFT / Bridge (`vision_sft_nano`), raw | 157.5 → 780.6 (**4.96×**) @18w; 62.5 → 462.2 (**7.40×**) @8w | 130.1 → 1047.3 (**8.05×**) @18w; 42.3 → 370.3 (**8.76×**) @8w |
+| VLM / LLaVA (`llava_ov`), raw access | 518 → 17,939 (**~35×**) | 518 → 35,741 (**~69×**) |
 
-| loader (recipe) | LOCAL | full S3 |
-| --------------- | ----- | ------- |
-| action / DROID (`action_policy_droid`) | 162.7 → 295.6 (**1.82×**) | 143.8 → 385.4 (**2.68×**) |
-| VLM / LLaVA (`llava_ov`) | 9,925 → 49,034 (**4.94×**) | 13,404 → 50,816 (**3.79×**) |
-| vision-SFT / Bridge (`vision_sft_nano`) | 130.2 → 1,071.6 (**8.23×**) | 105.6 → 768.6 (**7.28×**) |
-| **combined (1:1:1 mixer)** | **224.7 → 1,035.6 (4.61×)** | **197.3 → 1,278.1 (6.48×)** |
-
-**At cosmos-default 4 workers:**
-
-| loader | LOCAL | full S3 |
-| ------ | ----- | ------- |
-| action / DROID | 48.2 → 89.3 (1.85×) | 54.3 → 89.5 (1.65×) |
-| VLM / LLaVA | 15,292 → 42,316 (2.77×) | 14,829 → 49,715 (3.35×) |
-| vision-SFT / Bridge | 31.2 → 229.2 (7.35×) | 22.0 → 209.2 (9.5×) |
-| **combined (1:1:1 mixer)** | **88.8 → 252.7 (2.85×)** | **67.4 → 253.4 (3.76×)** |
-
-The combined row is the 1:1:1 mixer aggregate (bottleneck-gated by the slowest loader — action/vsft),
-**not** a sum of the per-loader columns; it's the same number as §1's matrix.
-
-(MIXED VLM base = HF-Hub streaming: 724 samples/s vs lance S3-scan 50,355 = ~70× — different work; VLM is
-never the mixer bottleneck.) vision-SFT is the biggest per-loader win and it **holds end-to-end** (~6.5×)
-because its only non-video work is a cheap tokenize; the VLM raw win is ~1× e2e (image-processor bound).
+Notes:
+- **action** is already the most optimized base loader (3-view decode), so the fair delta is
+  modest (~1.8×); the win is the pre-composed 1-clip representation, not NVDEC.
+- **vision-SFT** is the biggest e2e win and it **holds end-to-end** (~7.5×, `--mode e2e`,
+  60.8 → 453.9 @8w) because its only non-video work is a cheap tokenize. The 18-worker LOCAL
+  ratio (4.96×) is lower than 8-worker (7.40×) because the genuine `SFTDataset` base streams
+  sequentially and parallelizes well; both are honest — quote the worker count.
+- **VLM** raw ratio is large because the base is cosmos's *shipped* `streaming=True` source
+  (`get_llava_ov_streaming`), which decodes via the streaming protocol (≈518 samples/s even
+  across its 5 shards). This is **access-layer only**: VLM **end-to-end is ≈1×** (Qwen
+  image-processor bound) and VLM is **never the combined-mixer bottleneck**. Don't quote it as
+  a training speedup.
 
 ---
 
-## 3. Worker-allocation sweep (the dominant combined-throughput lever)
+## 3. Memory (action / DROID) — the scaling story
 
-LOCAL lance combined samples/s by allocation (action/vlm/vsft):
+Throughput is half the scaling problem; the base is also memory-heavy. `bench_memory.py`,
+8 workers, action loader, **PSS** (proportional set size — the fair physical-RAM metric, since
+fork shares pages copy-on-write and RSS would double-count them).
 
-| a/v/s (total) | combined | note |
-| ------------- | -------- | ---- |
-| 6/6/6 (18) | 351.8 | original equal-worker baseline |
-| 12/2/12 (26) | 606 | |
-| 16/2/16 (34) | 1169.6 | |
-| 18/2/10 (30) | 875 | vsft starved |
-| **18/4/18 (40)** | **1035–1272** | **optimum** (matrix 1036 / isolated run 1272; run-to-run variance) |
-| 20/2/20 (42) | — | action collapses (394→231 samp/s) — core oversubscription |
-| 28/2/10 (40) | 566 | action over-subscribed |
+### 3a. At the 327-ep benchmark scale (96k frames) — base is *leaner*
 
-The ceiling ≈ 3× the action loader's per-loader peak (~394 samp/s at ~18 workers on 48 cores). Past ~18
-workers/heavy-loader the 48 cores oversubscribe and throughput *degrades*. Optimal = give each heavy loader
-~its peak worker count, minimal workers to VLM, total ≲ cores. **Re-tune for other core counts**
-(`--action-workers/--vlm-workers/--vsft-workers`).
+| | peak total PSS | per-worker PSS |
+| - | -------------- | -------------- |
+| base | 6.8 GB | 651 MB |
+| Lance | 8.8 GB | 737 MB |
 
----
+At toy scale Lance is ~+90 MB/worker heavier — each `spawn` worker pays a fixed ~290 MB
+Arrow/Lance runtime (memory pools + IO thread pool) that outweighs the data savings. (Flat
+across decoder-cache sizes 2→32, so it is the runtime, not the cache.)
 
-## 4. Storage format — plain `large_binary` vs blob-v2 (the S3 read win)
+### 3b. Scaling with dataset size — Lance wins, and the gap widens
 
-Same ~1.7 MB mp4 clips, read from S3:
+The base's `ActionBaseDataset.__init__` materializes `self._rows` = **one Python dict per
+frame** (its own comment notes ~tens of GB at full DROID's ~18M frames). For the DROID loader
+this is **dead weight** (it reads windows from compact numpy arrays via `_window_rows` and
+overrides `__len__`), and with `spawn` workers it is pickled into **every** worker. The Lance
+loaders free it (`_FreeBaseRowsMixin`; output unchanged, equivalence still passes). Measured by
+replicating the subset N× (`build_scaled_droid.py`), random-sampler iteration, 8 workers:
 
-| access method | clips/s | MB/s |
-| ------------- | ------- | ---- |
-| blob-v2 `take_blobs` + readall loop (old) | 31 | 55 |
-| **plain `large_binary` + columnar `take` (new)** | **197** | **345** (**6.3×**) |
+| dataset | frames | base per-worker PSS | Lance per-worker PSS | peak total: base / Lance |
+| ------- | ------ | ------------------- | -------------------- | ------------------------ |
+| 1× | 96k | 651 MB | 737 MB | 6.8 / 8.8 GB |
+| 4× | 385k | 1044 MB | 777 MB | 10.9 / 9.2 GB |
+| 16× | 1.54M | **2612 MB** | **863 MB** | **27.1 / 10.9 GB** |
 
-`take_blobs` returns lazy handles read one-at-a-time → serialized GETs (unchanged by `LANCE_IO_THREADS`,
-`io_buffer_size`, or sorted indices — the reads are sequential in Python). Columnar `take` parallelizes
-across the IO thread pool. Effect on the read-bound loaders, S3 e2e: vision-SFT **178 → 376 (2.1×)**,
-action random **110 → 167 (1.5×)**. Loaders auto-detect the encoding; converters default to `--storage
-plain`. `data_storage_version` stays at **2.1** (2.2 is unstable in Lance 7.0.0).
+base per-worker grows ~**1.4 KB/frame** (the `_rows` dict list — 128 / 533 / 2153 MB at
+1×/4×/16×); Lance grows ~**0.09 KB/frame** (compact arrays only). **Crossover ≈ 4× (~1,300
+episodes)**: below it the base is leaner, above it Lance is. At 16× Lance per-worker is **~3×
+lower** and peak total **~2.5× lower**, and it keeps widening — extrapolated to full DROID
+(~18M frames) the base is ~25 GB/worker (× workers → OOM) while Lance stays a few GB. **Lance is
+the one that scales.** Disk footprint is also 0.35× (§5).
 
----
-
-## 5. End-to-end TRAINING (does the dataloader win make training faster?)
-
-Real GPU train step (transformer fwd+bwd, sized by `--layers` ≈ the omni MoT per-step compute) fed by the
-real combined mixer, MIXED regime, 18/4/18 workers, batch 16, **single L40S**. (No turnkey
-combined-dataloader training example ships in cosmos/cosmos-framework — the joint loader is wired in
-experiment Python for the 8B omni FSDP job — so the data path is 100% real and the model is a sized stand-in.)
-
-| per-step compute | base steps/s (samp/s) | lance steps/s (samp/s) | base data-wait | verdict |
-| ---------------- | --------------------- | ---------------------- | -------------- | ------- |
-| **tiny** (data-bound; fast-GPU proxy) | 19.1 (305) | **38.4 (614)** | 89.5% | **lance 2.0×** |
-| 2-layer transformer | 5.56 (89) | 5.56 (89) | 7.1% | identical |
-| 8-layer transformer | 1.44 (23) | 1.47 (23.5) | 1.7% | identical |
-
-**On a single GPU at a realistic model size, training is compute-bound** → the GPU waits <8% on data →
-base == lance wall-clock; the loader is hidden behind forward/backward. The Lance win converts to faster
-*training* only when **data-bound**: tiny/cheap compute, very fast GPUs (H100/B200), large data-parallel
-fan-out, or remote data. Even when hidden, Lance keeps the GPU fed with **far fewer CPU workers** (base
-needs 18 to hit 305 samp/s; lance hits 614) — a host-cost/efficiency win + native object-store training.
-
-**Weaker GPU = more compute-bound = hides the loader more.** A faster GPU finishes each step sooner →
-demands data faster → tips data-bound → surfaces the win. To find the crossover on H100/H200/B200, run
-[`RUN_BENCHMARKS_H100.md`](RUN_BENCHMARKS_H100.md).
+### 3c. fork (copy-on-write) cuts both
+Switching DataLoader workers to `fork` (lance fork support is experimental but produced
+**identical** output here) shares the parent's pages COW: e.g. Lance peak PSS 8.8 → 5.1 GB at
+1×. Helps both sides; use the same start method on both for an apples-to-apples comparison.
 
 ---
 
-## 6. Cold cache (is the LOCAL benchmark unfairly warm?)
+## 4. Correctness (prerequisite for any throughput/memory claim)
 
-Action loader, page cache dropped between passes: base **2–3%** / lance **11–19%** cold penalty — tiny,
-because at subset scale the bottleneck is CPU decode, not I/O. A genuine larger-than-RAM regime is **not
-reproducible** on a 372 GB box (torch worker RSS crowds out the page-cache budget before the 0.5–2 GB
-dataset does, even under a `MemoryMax=6G` cgroup). S3 is the faithful I/O-bound proxy. Tool:
-`benchmarks/lance/bench_cold_cache.py` (`--drop-caches`, or wrap in `systemd-run --scope -p MemoryMax=`).
+| loader | per-sample test | batch test (`__getitems__` hot path) |
+| ------ | --------------- | ------------------------------------ |
+| action / DROID | `test_action_equivalence.py` **8/8** — raw-bytes video bit-exact, action bit-exact | `test_batch_equivalence.py` — composed (benchmarked): labels bit-exact, video within H.264 tol; raw-bytes: pixel-identical |
+| vision-SFT | `test_vision_sft_equivalence.py` **7/7** — token-ids exact, video within tol | batch: token-ids exact, video within tol |
+| VLM | `test_vlm_equivalence.py` **3/3** — records byte-identical | batch: records byte-identical |
 
----
-
-## 7. Correctness (output-equivalent to the base — prerequisite for any throughput claim)
-
-| loader | test | result |
-| ------ | ---- | ------ |
-| action / DROID | `tests/data/lance/test_action_equivalence.py` | **8/8 bit-exact** (`video max|Δ|=0`, `action max|Δ|=0`) |
-| vision-SFT | `tests/data/lance/test_vision_sft_equivalence.py` | **7/7** — token-ids exact, video within H.264 tolerance |
-| VLM | `tests/data/lance/test_vlm_equivalence.py` | **3/3** — records byte-identical vs the HF stream |
-
-Plain-vs-blob storage is byte-identical, so equivalence holds for both encodings.
+22 tests total. Labels / token-ids / VLM records are **exact**; the fast video paths (composed
+action, vision-SFT) match within one offline H.264 re-encode. Plain-vs-blob storage is
+byte-identical, so equivalence holds for both encodings.
 
 ---
 
-## 8. Base loader storage — local, remote, or combined? → **COMBINED**
+## 5. Storage — plain `large_binary`, and dataset sizes
 
-Verified in the cosmos source:
-- **action / LeRobot** — local filesystem only, `Path(root)` + `pq.read_table` (`data/vfm/action/datasets/base_dataset.py:65-80`).
-- **VLM / LLaVA** — HuggingFace Hub streaming, `load_dataset(..., streaming=True)` (`configs/base/vlm/experiment/llava_ov_vlm.py:73-74`).
-- **vision-SFT** — S3 via boto3, `download_from_s3(...)` (`data/vfm/local_datasets/sft_dataset.py:97,196,366`), local fallback (`helper.py:37-38`).
+`take_blobs` (blob-v2) returns lazy handles read one GET at a time → serialized on S3; storing
+clips as **plain `large_binary`** and reading via columnar `take` parallelizes across the IO
+thread pool (**~6× faster** S3 reads for <2 MB clips). Loaders auto-detect; converters default
+to `--storage plain`. `data_storage_version` stays at **2.1** (2.2 is unstable in Lance 7.0.0).
 
-So real Cosmos training reads local disk **and** remote object storage at once — the MIXED regime.
+On-disk size of the combined store actually built (Lance tables, gop=1 all-intra):
+
+| modality | base format & size | Lance | ratio |
+| -------- | ------------------ | ----- | ----- |
+| action / DROID, 327 eps | raw 3-view mp4 **1.55 GB** | composed **0.55 GB** | **0.35×** |
+| VLM / LLaVA figureqa, 99,995 | HF parquet **2.22 GB** | **2.23 GB** | ~1.0× (original bytes, no re-encode) |
+| vision-SFT / Bridge, 200 clips | raw mp4 + jsonl **0.10 GB** | **0.11 GB** | ~1.1× |
+| **combined** | **~3.9 GB** | **~2.9 GB** | **0.75×** |
+
+Smaller overall, driven by the composed action store (3→1 view, half-res > the all-intra
+penalty). The bit-exact action variant (raw mp4 bytes) is ~1.5 GB ≈ base.
 
 ---
 
-## 9. Dataset sizes — the recreated combined-view store (measured)
+## 6. Base loader storage (verified in the cosmos source)
 
-On-disk size of the datasets actually built for these benchmarks (S3 byte sums; local matches within
-rounding). Lance tables use plain `large_binary`, gop=1 (all-intra).
+- **action / LeRobot** — local filesystem only, `Path(root)` (`data/vfm/action/datasets/base_dataset.py`).
+- **VLM / LLaVA** — HF-Hub streaming, `get_llava_ov_streaming` → `load_dataset(..., streaming=True)`
+  (`configs/base/vlm/experiment/llava_ov_vlm.py`).
+- **vision-SFT** — S3 via boto3 `download_from_s3` with a local fallback (`sft_dataset.py`, `helper.py`).
 
-| modality (combined view) | base format & size | Lance size | ratio | representation |
-| ------------------------ | ------------------ | ---------- | ----- | -------------- |
-| action / DROID — 327 eps, 3×320×180 | raw 3-view mp4 **1.55 GB** | composed **0.55 GB** | **0.35×** | 3 views → 1 half-res all-intra clip/episode |
-| VLM / LLaVA figureqa — 99,995 samples | HF parquet **2.22 GB** (wds tar 2.76 GB) | **2.23 GB** | **~1.0×** | original PNG bytes inline, no re-encode |
-| vision-SFT / Bridge — 200 clips, 256² | raw mp4 + jsonl **0.10 GB** | **0.11 GB** | **~1.1×** | pre-resized all-intra clip/sample |
-| **combined total** | **~3.87 GB** (4.4 GB if VLM = wds) | **~2.89 GB** | **0.75×** | smaller overall, driven by composed action |
-
-The combined Lance store is **smaller than the base** — the action composed clips (3→1 view, half-res)
-more than offset the all-intra penalty, while VLM/vision-SFT store the original bytes columnar (no blowup,
-no re-encode for VLM). The bit-exact action variant (`droid_video`, raw mp4 bytes as a blob) is ~1.5 GB ≈
-base (it keeps the original bytes); the composed variant is the small one. Action representation footprint
-scales with GOP: gop=1 (shipped, fastest seek) **0.35×**, gop=8 → ~0.18× the original. Per-frame JPEG
-(rejected) would be **1.8×** — the reason that format was vetoed.
+So real cosmos training reads local disk **and** remote object storage at once; the benchmarks
+exercise both regimes against these genuine loaders.
 
 ---
 
 ## Reproduce
-
-Env: Python 3.12, `torch==2.10+cu128` / `torchvision` / `torchcodec` matched, `nvidia-npp-cu12` on
-`LD_LIBRARY_PATH` — `source benchmarks/lance/.venv-gpu/bin/activate` (NOT `_env.sh`, which is stale).
-Datasets public on HF (`lerobot/droid_1.0.1`, `lmms-lab/LLaVA-OneVision-Data`,
-`nvidia/BridgeData2-Subset-Synthetic-Captions`). Build the plain tables with the `tools/lance_datagen/*`
-converters (`--storage plain`). Then:
-
-```bash
-# full combined matrix (LOCAL/S3/MIXED × 4-4-4 / 18-4-18)
-bash benchmarks/lance/run_matrix.sh
-# single-loader / worker sweep
-python benchmarks/lance/bench_combined_faithful.py … --action-workers A --vlm-workers V --vsft-workers S --trios lance
-# storage-format read win
-python benchmarks/lance/bench_take_vs_blobs.py --uri s3://…/droid_composed327_plain/… --region us-east-2
-# e2e training compute sweep
-python benchmarks/lance/train_combined_e2e.py --trio {base,lance} --regime {local,s3,mixed} --layers L …
-# multi-GPU H100/H200/B200: see RUN_BENCHMARKS_H100.md
-```
-
-Step-by-step (env, downloads, conversions, S3 setup, expected numbers): [`REPRODUCE.md`](REPRODUCE.md).
+Env + datasets + conversions + the exact commands: [`REPRODUCE.md`](REPRODUCE.md). In short:
+`source benchmarks/lance/.venv-gpu/bin/activate`, build the plain tables with
+`tools/lance_datagen/*`, then `bash benchmarks/lance/run_matrix.sh` (throughput) and
+`python benchmarks/lance/bench_memory.py …` (+ `build_scaled_droid.py` for the scaling rows).

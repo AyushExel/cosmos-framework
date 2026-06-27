@@ -51,9 +51,11 @@ from — i.e. you'd be rebuilding Lance.
 ### Equivalence & win
 Action/captions/poses are **bit-exact** (all index/pose/action logic is inherited unchanged); video
 differs only by the H.264 re-encode (PSNR ~32 dB, mean|Δ|≈1.6%). A separate `LanceDROIDDataset` stores the
-original mp4 bytes for **byte-exact** parity (used by the equivalence test). Measured single-modality:
-**1.82× LOCAL / 2.68× S3** (18 workers). Disk is **0.35× the original** (fusing 3 views → 1 half-res clip
-more than offsets the all-intra penalty) — not a blowup, and nowhere near per-frame-JPEG (1.8×, rejected).
+original mp4 bytes for **byte-exact** parity (used by the equivalence test). Measured single-modality vs
+the genuine base: **1.77× LOCAL / 1.94× S3** (18 workers). Disk is **0.35× the original** (fusing 3 views →
+1 half-res clip more than offsets the all-intra penalty) — not a blowup, nowhere near per-frame-JPEG (1.8×,
+rejected). Action is already the most-optimized base loader, so the fair delta is modest — but the
+pre-composed representation also slashes per-worker **memory** at scale (see §4e).
 
 ---
 
@@ -80,12 +82,12 @@ A tar is sequential-only; its shuffle is a local buffer. Lance gives random acce
 columnar/selective reads (fetch only the rows/columns a curriculum needs) the tar/stream model can't.
 
 ### Win & the honest caveat
-Single-modality **4.94× LOCAL / 3.79× S3** raw access (and up to ~22× at very large batch). **But the
-VLM end-to-end step is gated by the Qwen image-processor** (patchify/normalize + tokenize), which is
-storage-independent — so single-node **e2e is ~1×**. The access win surfaces e2e only at scale (object
-storage, many nodes, true global shuffle) or when that compute is precomputed. VLM is also never the
-combined-mixer bottleneck (it's 10–400× faster than the video loaders). Report the regime; don't quote the
-raw ratio as an e2e win.
+Single-modality raw access **~35× LOCAL / ~69× S3** — but read that carefully: the base is cosmos's
+*shipped* `streaming=True` source (`get_llava_ov_streaming`), which decodes via the HF streaming protocol
+(~518 samples/s even across its shards), so the large ratio is mostly streaming-protocol overhead, not a
+fundamental access win. **The VLM end-to-end step is gated by the Qwen image-processor** (storage-independent)
+→ single-node **e2e is ~1×**. VLM is also **never the combined-mixer bottleneck** (10–400× faster than the
+video loaders). Report the regime; **never quote the raw ratio as an e2e/training win.**
 
 ---
 
@@ -109,7 +111,10 @@ offline** (the base's exact resize), re-encodes **all-intra (`gop=1`)**, and sto
 ### Why the win holds end-to-end (unlike VLM)
 The only non-video work is one chat-template tokenize (cheap), so the video savings aren't masked.
 Token-ids are **exact**; video within H.264 tolerance (mean|Δ|≈1.3%). Measured single-modality
-**8.23× LOCAL / 7.28× S3** (18 workers) — and it holds e2e (~6.5×). This is the largest per-loader win.
+**4.96× @18w / 7.40× @8w LOCAL · 8.05× @18w / 8.76× @8w S3** (vs the genuine `SFTDataset`) — and it
+**holds end-to-end** (~7.5×, 60.8 → 453.9 @8w). This is the largest per-loader win. (The 18w LOCAL ratio
+is lower than 8w because the genuine base streams sequentially and parallelizes well — quote the worker
+count; both are honest.)
 
 ---
 
@@ -143,10 +148,21 @@ connection params; `__getstate__` nulls all live handles so it pickles cleanly t
 DataLoader hands the whole batch's indices at once, so reads/decodes are batched (one `take`/`take_blobs`
 + one `get_frames_at` per file), not per-sample.
 
-### 4d. Decode device (fairness note)
-All base-vs-lance comparisons use **CPU decode on both sides** (the base can only decode on CPU). NVDEC is
-*not* the win at these small robot frames (it's slower than many-core CPU per torchcodec's own perf docs);
-the win is the optimized stored representation + access layer, which is why it's a fair comparison.
+### 4d. Fairness (genuine bases, CPU decode both sides)
+All comparisons use **CPU decode on both sides** (the base can only decode on CPU; NVDEC is *not* the win at
+these small frames). Every base side is the **genuine shipped loader** — `DROIDLeRobotDataset`, the real
+`SFTDataset`, `get_llava_ov_streaming` — not a reconstruction. Where the base has no native S3 path, an
+explicit, documented standin (`benchmarks/lance/base_standins.py`) gives it the fairest object-store access
+(action: download the mega-mp4s then genuine decode; vision-SFT: the genuine per-sample boto3 download).
+This *lowers* the reported S3 speedups vs earlier FUSE-based drafts — and makes them honest.
+
+### 4e. Memory scaling (the other half of the scaling story)
+The base `ActionBaseDataset.__init__` builds `self._rows` = **one Python dict per frame** (dead weight for
+the DROID loader, which reads windows from compact numpy arrays), and `spawn` workers each copy it — ~tens
+of GB at full DROID. The Lance loaders free it (`_FreeBaseRowsMixin`; output unchanged). Net: per-worker RAM
+grows ~1.4 KB/frame for the base vs ~0.09 KB/frame for Lance, so past ~1,300 episodes Lance wins and at 16×
+(1.54M frames) it's **~3× lighter per worker** (the base trends to OOM). At toy scale Lance is slightly
+heavier (a fixed ~290 MB/worker Arrow runtime). `fork` (COW page-sharing) cuts both. See [`BENCHMARKS.md`](BENCHMARKS.md) §3.
 
 ---
 
@@ -154,11 +170,13 @@ the win is the optimized stored representation + access layer, which is why it's
 
 | loader | base bottleneck | Lance mechanism | win kind | measured (single-modality) |
 | ------ | --------------- | --------------- | -------- | --------------------------- |
-| action / DROID | 3-view decode + resize + concat per sample/epoch | pre-composed 1-clip, all-intra, per-episode blob, decoder-cache reuse | representation + access | 1.82× LOCAL / 2.68× S3 |
-| VLM / LLaVA | sequential tar / HF-stream + shuffle buffer, no random access | columnar random access + global shuffle / chunked-shuffle scan | access | 4.94× LOCAL / 3.79× S3 raw (≈1× e2e, compute-bound) |
-| vision-SFT / Bridge | per-sample ffmpeg seek+decode+scale subprocess | pre-resized all-intra clip, in-process torchcodec, batched decode | representation + access | 8.23× LOCAL / 7.28× S3 (holds e2e) |
-| **all, on S3** | serialized `take_blobs` GETs | **plain `large_binary` + columnar `take`** | access | 6.3× raw blob read; 2.1× vsft e2e |
-| **combined** | flat per-loader workers, gated by slowest | **worker rebalancing** toward the bottleneck loaders | scheduling | ~4× the equal-worker combined |
+| action / DROID | 3-view decode + resize + concat per sample/epoch | pre-composed 1-clip, all-intra, per-episode blob, decoder-cache reuse | representation + access + memory | 1.77× LOCAL / 1.94× S3 |
+| VLM / LLaVA | sequential HF-stream + shuffle buffer, no random access | columnar random access + global shuffle / chunked-shuffle scan | access | ~35× LOCAL / ~69× S3 raw (**≈1× e2e**, compute-bound) |
+| vision-SFT / Bridge | per-sample ffmpeg seek+decode+scale subprocess | pre-resized all-intra clip, in-process torchcodec, batched decode | representation + access | 4.96–7.40× LOCAL / 8.05–8.76× S3 (holds e2e ~7.5×) |
+| **all, on S3** | serialized `take_blobs` GETs | **plain `large_binary` + columnar `take`** | access | ~6× raw blob read |
+| **combined** | flat per-loader workers, gated by slowest | **worker rebalancing** toward the bottleneck loaders | scheduling | ~3.3× LOCAL / ~4.9× S3 (tuned) |
+| **action memory, at scale** | per-frame `_rows` dict pickled to every worker | free the dead index; compact arrays only | memory | ~3× lower/worker at 16× |
 
-See [`BENCHMARKS.md`](BENCHMARKS.md) for full tables, `VALIDATION.md` for the representation-preserves-data proofs, and the
-equivalence tests in `tests/data/lance/`.
+See [`BENCHMARKS.md`](BENCHMARKS.md) for full tables (throughput, memory, scaling),
+[`WALKTHROUGH.md`](WALKTHROUGH.md) for the code/schema, and the equivalence tests in
+`tests/data/lance/` (per-sample + batch-level) for the representation-preserves-data proofs.

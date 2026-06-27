@@ -210,7 +210,18 @@ parallelize the GETs across the IO thread pool (**~6× faster on S3**, measured)
 converters default to `--storage plain`. Bytes are identical either way, so equivalence
 holds. `data_storage_version` stays at the stable **2.1** (2.2 is unstable in Lance 7.0.0).
 
-### 4d. Why equivalence is preserved by construction
+### 4d. Memory: freeing the base's dead per-frame index
+`ActionBaseDataset.__init__` (`base_dataset.py`) materializes `self._rows` — **one Python dict per
+frame** (its own comment notes ~tens of GB at full DROID's ~18M frames). The DROID loaders read windows
+from compact numpy arrays via `_window_rows` and override `__len__`, so `self._rows` is **dead weight**
+for them — and with `spawn` workers (Lance needs spawn) it's pickled into *every* worker, multiplying the
+footprint. The Lance action loaders free it in `__init__` (`_FreeBaseRowsMixin`, `action_dataset.py`),
+which is safe (unused) and leaves output unchanged. Effect: per-worker RAM grows ~1.4 KB/frame for the base
+vs ~0.09 KB/frame for Lance, so at real DROID scale Lance is several× lighter per worker (the base trends to
+OOM). The base can't drop it globally — other action loaders (agibot/robomind/bridge) genuinely use
+`self._rows` — so the per-loader Lance port is the clean place to fix it. Numbers: [`BENCHMARKS.md`](BENCHMARKS.md) §3.
+
+### 4e. Why equivalence is preserved by construction
 - **Action**: all index/pose/action/caption logic is *inherited unchanged* from
   `DROIDLeRobotDataset`; only the video bytes' origin differs. Video is bit-exact for the
   raw-bytes variant, within H.264 tolerance for the composed variant.

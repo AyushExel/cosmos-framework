@@ -1,141 +1,121 @@
 # Reproducing the LanceDB-vs-base dataloader benchmarks
 
-Everything an independent user/agent needs to recreate these numbers from scratch on their
-own machine. Three regimes: **LOCAL** (apples-to-apples, cosmos's documented workflow), **S3**
-(Lance object-store-native vs the base's stock S3 access), and **DEFAULT-MIXED** (each loader on
-its real default storage). All comparisons are **CPU-decode on both sides** (the base can only
-decode on CPU — never compare CPU-vs-GPU).
+Everything to recreate these numbers from scratch. All comparisons are against the **genuine
+shipped base loaders**, CPU decode on both sides. Two regimes: **LOCAL** (cosmos's
+pre-download-then-train workflow) and **S3** (Lance native `s3://` vs the base's only object-store
+path). Plus the **memory** + **memory-scaling** benchmarks.
 
 ## 0. Hardware / OS
-- Linux, x86-64. A CUDA GPU is **not** required for the dataloader benchmarks (decode is CPU);
-  it is only needed for the training-equivalence scripts (`train_equiv_real.py`).
-- System `ffmpeg` (the loaders decode via torchcodec/ffmpeg). FFmpeg 7 or 8 both work.
-- ~5 GB disk for the subsets + Lance tables. For the S3 regime, an AWS account + bucket.
+- Linux x86-64. A CUDA GPU is **not** required for the dataloader/memory benchmarks (decode is CPU);
+  only `train_combined_e2e.py` needs a GPU.
+- System `ffmpeg` (torchcodec/ffmpeg decode). FFmpeg 7 or 8.
+- ~5 GB disk for the subsets + Lance tables (more for the scaling test). S3 regime needs an AWS bucket.
 
-## 1. Python environment (exact — this is the fiddly part)
-Python 3.12 venv. **torchcodec must match torch exactly**, and its `.so` needs the CUDA + NPP +
-ffmpeg libs on `LD_LIBRARY_PATH` — even for CPU decode (the wheel links them). Pin torch with a
-constraints file so installing the data deps can't silently downgrade it to a CPU build.
+## 1. Python environment
+Python 3.12. **torchcodec must match torch exactly**, and its `.so` needs the CUDA/NPP/ffmpeg libs on
+`LD_LIBRARY_PATH` even for CPU decode. The repo's `benchmarks/lance/.venv-gpu` already does this —
+`source benchmarks/lance/.venv-gpu/bin/activate` (it appends the NPP `LD_LIBRARY_PATH`). To build fresh:
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
-python -m pip install -U pip
-
-# (a) the CUDA torch stack — torchcodec 0.10 pairs with torch 2.10 (cu128)
+python3.12 -m venv .venv-gpu && source .venv-gpu/bin/activate && python -m pip install -U pip
 pip install --index-url https://download.pytorch.org/whl/cu128 \
     torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchcodec==0.10.0+cu128
-pip install nvidia-npp-cu12==12.3.3.100      # torchcodec_core*.so needs libnppicc
-
-# (b) pin torch so the next installs can't clobber it
+pip install nvidia-npp-cu12==12.4.1.87      # torchcodec_core*.so needs libnppicc; add its lib dir to LD_LIBRARY_PATH
 printf 'torch==2.10.0+cu128\ntorchvision==0.25.0+cu128\ntorchcodec==0.10.0+cu128\n' > /tmp/cons.txt
-
-# (c) data + framework deps (under the constraint)
+# data + framework deps (the VLM base imports the genuine config module, which needs the full cosmos stack):
 pip install -c /tmp/cons.txt --extra-index-url https://download.pytorch.org/whl/cu128 \
-    lerobot webdataset transformers peft einops datasets \
-    scipy opencv-contrib-python imageio imageio-ffmpeg mediapy \
-    loguru cattrs hydra-core omegaconf termcolor tyro msgpack nvidia-ml-py av obstore \
-    boto3==1.40.0 botocore s3fs iopath \
-    pytest pytest-xdist pytest-custom_exit_code
+    lancedb pylance lerobot webdataset transformers peft einops datasets \
+    scipy opencv-contrib-python imageio imageio-ffmpeg mediapy psutil \
+    hydra-core "multi-storage-client[boto3]==0.44.0" qwen-vl-utils \
+    loguru cattrs omegaconf termcolor tyro msgpack nvidia-ml-py av obstore boto3 botocore \
+    pytest pytest-xdist
+python -c "import torch,torchcodec,lance,lerobot; from cosmos_framework.configs.base.vlm.experiment.llava_ov_vlm import get_llava_ov_streaming; print('ok', torch.__version__)"
 ```
-
-**Always `source benchmarks/lance/_env.sh` before running** — it puts the NPP/CUDA/ffmpeg lib
-dirs on `LD_LIBRARY_PATH` and the repo on `PYTHONPATH`. Verify:
-```bash
-source benchmarks/lance/_env.sh
-python -c "import torch,torchcodec,lerobot,lance; from torchcodec.decoders import VideoDecoder; \
-  print('ok', torch.__version__, torch.cuda.is_available())"
-```
+Then `export PYTHONPATH=$REPO` and (for S3) an AWS profile (default chain or `AWS_PROFILE=...`).
 
 ## 2. Datasets (public on HF)
 ```bash
-export HF_TOKEN=...   # needed for LLaVA-OneVision streaming/download
-# action: DROID
+export HF_TOKEN=...
 hf download lerobot/droid_1.0.1 --repo-type dataset --local-dir <droid_raw>
-# vision-SFT: BridgeData2 synthetic captions  (has train/video_dataset_file.jsonl + videos/)
 hf download nvidia/BridgeData2-Subset-Synthetic-Captions --repo-type dataset --local-dir <bridge>
-# VLM: LLaVA-OneVision-Data — the figureqa subset (streamed at run time for the base; converted for Lance)
+# LLaVA-OneVision-Data figureqa subset is streamed at run time for the base; converted for Lance below
 ```
 
 ## 3. Build the Lance tables + Cosmos-format subset (offline, one-time)
 ```bash
-source benchmarks/lance/_env.sh
-# action: rename DROID -> Cosmos schema, then pre-compose 3 views -> 1 all-intra clip/episode
+source benchmarks/lance/.venv-gpu/bin/activate
 python tools/lance_datagen/prepare_droid_subset.py --src <droid_raw> --out <droid_out> --num-episodes 327
-python tools/lance_datagen/build_composed_droid.py --root <droid_out>/success --uri <droid_lance_dir> --gop 1
-# vision-SFT: re-encode each clip pre-resized + all-intra into a blob-v2 table
+python tools/lance_datagen/build_composed_droid.py --root <droid_out>/success --uri <droid_lance> --gop 1 --storage plain
 python tools/lance_datagen/build_vision_sft.py --jsonl <bridge>/sft_dataset_bridge/train/video_dataset_file.jsonl \
-    --uri <vsft_lance_dir> --resolution 256 --gop 1
-# VLM: convert the figureqa subset to a Lance table (stores original PNG bytes inline, no re-encode)
+    --uri <vsft_lance> --resolution 256 --gop 1 --storage plain
 python -c "from datasets import load_dataset; from cosmos_framework.data.lance.vlm_dataset import convert_llava_to_lance; \
-  convert_llava_to_lance(load_dataset('lmms-lab/LLaVA-OneVision-Data', name='figureqa(cauldron,llava_format)', split='train'), '<llava_lance_dir>')"
-# (optional, for the webdataset-tar VLM base variant) python tools/lance_datagen/build_wds_shards.py --out <wds_dir>
+  convert_llava_to_lance(load_dataset('lmms-lab/LLaVA-OneVision-Data', name='figureqa(cauldron,llava_format)', split='train'), '<llava_lance>')"
+# (optional) bit-exact action table for the strict-parity test:
+python tools/lance_datagen/build_composed_droid.py ...   # or the LanceDROIDDataset raw-bytes table
 ```
 
-## 4. Equivalence (prove identical output before trusting throughput)
+## 4. Equivalence — prove identical output before trusting throughput
 ```bash
 DROID_COSMOS_ROOT=<droid_out>/success DROID_LANCE_URI=<droid_videoblob_lance> \
-BRIDGE_JSONL=<bridge>/sft_dataset_bridge/train/video_dataset_file.jsonl VISION_SFT_LANCE_URI=<vsft_lance_dir> \
-  python -m pytest tests/data/lance/test_action_equivalence.py tests/data/lance/test_vision_sft_equivalence.py
-# expect 15 passed (action video/labels bit-exact; vision-SFT token ids exact)
+DROID_COMPOSED_LANCE_URI=<droid_lance> \
+BRIDGE_JSONL=<bridge>/sft_dataset_bridge/train/video_dataset_file.jsonl VISION_SFT_LANCE_URI=<vsft_lance> \
+HF_TOKEN=$HF_TOKEN \
+  python -m pytest tests/data/lance/test_action_equivalence.py tests/data/lance/test_vision_sft_equivalence.py \
+    tests/data/lance/test_vlm_equivalence.py tests/data/lance/test_batch_equivalence.py
+# expect 22 passed: action bit-exact, vision-SFT token-exact, VLM byte-identical, + batch-level (composed loader)
 ```
 
-## 5. Benchmarks
-Run `--trios base` and `--trios lance` in **separate processes** (a single process hits a benign
-torchcodec/lance SIGABRT at teardown between trios). Numbers below were measured on a 48-CPU + L40S
-node, 327 DROID episodes, 1:1:1 mixer, 6 workers/loader, batch 16.
-
-### 5a. LOCAL (apples-to-apples — cosmos's documented download-to-local workflow)
+## 5. Throughput benchmarks
+Run `--trios base` and `--trios lance` in **separate processes** (one process hits a benign
+torchcodec/lance teardown between trios). Each per-loader bench also isolates each side/mode in its own
+spawn subprocess. The full matrix driver:
 ```bash
-for t in base lance; do
-  python benchmarks/lance/bench_combined_faithful.py \
-    --action-root <droid_out>/success --action-uri <droid_lance_dir> \
-    --vlm-wds "<wds_dir>/shard-{00000..00019}.tar" --vlm-uri <llava_lance_dir> \
-    --vsft-jsonl <bridge>/.../video_dataset_file.jsonl --vsft-uri <vsft_lance_dir> \
-    --batch-size 16 --num-workers 6 --rounds 30 --warmup 10 --trios $t
-done
+DATA=<data_root> S=s3://<bucket>/cosmos BUCKET=<bucket> REGION=<region> \
+  bash benchmarks/lance/run_matrix.sh          # LOCAL + S3 + MIXED × {4/4/4, 18/4/18} × {base, lance}
 ```
-Expected: action **1.93×**, VLM raw 1.63×, vision-SFT **7.57×**, **combined 3.11×** (122→380 samples/s).
-
-### 5b. S3 (Lance native `s3://` vs the base's stock S3 access)
-Upload the Lance tables + the vision-SFT base videos to a bucket; set AWS creds (`AWS_PROFILE`) and
-`LANCE_IO_THREADS=256`. The base reads each dataset the way its stock loader does — action/VLM via an
-s3fs FUSE mount (no native reader), vision-SFT via boto3 download-per-sample (`--vsft-s3-bucket/prefix`).
+Per-loader, e.g. action (LOCAL then native-S3 standin):
 ```bash
-export AWS_PROFILE=<profile> LANCE_IO_THREADS=256
-for t in base lance; do
-  python benchmarks/lance/bench_combined_faithful.py \
-    --action-root <s3fs_mount>/.../success --action-uri s3://<bucket>/.../droid_composed \
-    --vlm-wds "<s3fs_mount>/.../shard-{00000..00019}.tar" --vlm-uri s3://<bucket>/.../llava \
-    --vsft-jsonl <local>/video_dataset_file.jsonl --vsft-uri s3://<bucket>/.../vision_sft \
-    --vsft-s3-bucket <bucket> --vsft-s3-prefix <prefix>/sft_dataset_bridge/train \
-    --region <region> --batch-size 16 --num-workers 6 --rounds 30 --warmup 10 --trios $t
-done
+python benchmarks/lance/bench_action_faithful.py --root <droid_out>/success --uri <droid_lance> --num-workers 18
+python benchmarks/lance/bench_action_faithful.py --root <droid_out>/success \
+    --uri s3://<bucket>/.../droid_composed_plain --region <region> \
+    --s3-bucket <bucket> --s3-prefix cosmos/droid327/base/success --num-workers 18
+python benchmarks/lance/bench_vision_sft.py --jsonl <jsonl> --uri <vsft_lance> --mode raw --num-workers 8 18
+python benchmarks/lance/bench_vlm.py --side base  --lance-uri <llava_lance> --mode raw   # run twice:
+python benchmarks/lance/bench_vlm.py --side lance --lance-uri <llava_lance> --mode raw   # base, then lance; divide
 ```
-Expected: action 1.71×, VLM raw 1.70×, vision-SFT 2.66×, **combined 2.64×** (95→252 samples/s).
+Expected (327 eps, batch 16): combined **2.75× LOCAL / 3.65× S3** at 4/4/4, **3.32× / 4.93×** at 18/4/18;
+per-loader action ~1.8×, vision-SFT ~5–8× (holds e2e), VLM raw large but ≈1× e2e. Full tables:
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
-### 5c. DEFAULT-MIXED (each loader on its real default storage)
-base: action=LOCAL, vision-SFT=S3(boto3), VLM=HF-Hub streaming · lance: action=LOCAL, vision-SFT=S3, VLM=S3.
-Same command as 5b but `--action-root`/`--action-uri` are **local**, and add
-`--vlm-hf-subset "figureqa(cauldron,llava_format)"` (streams the base VLM from HF — needs `HF_TOKEN`).
-`storage_options` auto-applies only to `s3://` uris, so local action + S3 vsft/VLM coexist in one run.
-Expected: action 1.70×, vision-SFT 2.51×, **combined 2.66×** (95→254 samples/s). (VLM shows a huge raw
-ratio — base HF-stream 901 vs Lance S3-scan 39,428 — but it's never the mixer bottleneck.)
+## 6. Memory + memory-scaling
+```bash
+# at benchmark scale (action loader, 8 workers): base is slightly leaner here (fixed Arrow runtime)
+python benchmarks/lance/bench_memory.py --side base  --root <droid_out>/success --uri <droid_lance> --random
+python benchmarks/lance/bench_memory.py --side lance --root <droid_out>/success --uri <droid_lance> --random
+# spawn vs fork (COW): add --mp-context fork ; PSS is reported for fair COW accounting
 
-**All three regimes agree: combined ≈ 2.6–3.1×**, gated by the slowest (video) loader.
+# scaling: replicate the subset N× and re-measure — base per-worker RAM balloons (self._rows), Lance stays flat
+python benchmarks/lance/build_scaled_droid.py --src-root <droid_out>/success --src-lance <droid_lance> \
+    --out-root /tmp/droid_x16 --out-lance /tmp/lance_x16 --table droid_composed --n 16
+ln -sfn <droid_out>/success/videos /tmp/droid_x16/videos
+for s in base lance; do python benchmarks/lance/bench_memory.py --side $s --root /tmp/droid_x16 --uri /tmp/lance_x16 --random; done
+```
+Expected: per-worker PSS at 16× (1.54M frames) base ~2.6 GB vs Lance ~0.86 GB (crossover ≈ 4×). Details:
+[`BENCHMARKS.md`](BENCHMARKS.md) §3.
 
-## 6. Single-loader / diagnostic scripts
-- `bench_action_faithful.py --modes base-random base-episode lance-random lance-episode` — the action
-  2×2 (shows the speedup is worker-count-dependent, shuffle-mode-neutral locally).
-- `bench_vlm.py`, `bench_vision_sft.py`, `bench_decode.py` — per-loader / decode microbenchmarks.
-- `bench_filtered.py` — predicate-pushdown (curriculum/quality filtering) capability demo.
-- `train_equiv_real.py`, `train_databound_demo.py`, `train_multigpu_time.py` — training-time / equivalence (need a GPU).
+## 7. E2E training (optional, needs a GPU)
+```bash
+python benchmarks/lance/train_combined_e2e.py --trio {base,lance} --regime {local,s3,mixed} --layers L \
+   --action-workers 18 --vlm-workers 4 --vsft-workers 18
+```
+Sweeping `--layers` traces the data-bound → compute-bound crossover (at realistic model size single-GPU
+training is compute-bound → base ≈ lance wall-clock; the loader win surfaces data-bound / fast-GPU / remote).
 
-## 7. Gotchas (learned the hard way)
-- **Same decode device both sides** — always CPU. The base can't use GPU; cu128 torchcodec ≠ GPU decode.
-- **Separate process per trio** (`--trios base` then `--trios lance`) to dodge the teardown SIGABRT.
-- **The combined number is bottleneck-gated** (aggregate ≈ 3×slowest loader); report the per-loader
-  breakdown alongside it, never a bare combined multiple.
-- **S3 base access matters**: ffmpeg-through-FUSE is much slower than boto3 download-per-sample — use
-  each base loader's *actual* stock S3 path, or you'll inflate the win (see BENCHMARKS.md).
-- We did **not** modify any stock base loader; S3 reading is either FUSE (no code change) or the base's
-  own already-shipped boto3 reader.
+## 8. Gotchas
+- **Same decode device both sides** — always CPU. The base can't use GPU.
+- **Separate process per trio** for the combined bench; per-loader benches self-isolate each measurement.
+- **The combined number is bottleneck-gated** (≈ slowest loader); report the per-loader breakdown with it.
+- **Genuine bases, no FUSE**: action S3 uses the `S3DROIDLeRobotDataset` standin (download then genuine
+  decode), vision-SFT uses the genuine `SFTDataset` per-sample boto3, VLM uses `get_llava_ov_streaming`.
+  These are fairer (and lower) than the old FUSE-based S3 numbers.
+- **VLM raw ratio is access-only** (≈1× e2e). Don't quote it as training speedup.

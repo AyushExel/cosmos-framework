@@ -93,6 +93,12 @@ def main():
                     "(measure with PSS); lance fork support is experimental.")
     ap.add_argument("--free-base-rows", action="store_true",
                     help="(base only) free self._rows before iterating — isolates the per-worker _rows cost")
+    ap.add_argument("--random", action="store_true",
+                    help="iterate with a RandomSampler (touches all episodes across a scaled table) "
+                    "instead of sequentially")
+    ap.add_argument("--skip-iterate", action="store_true",
+                    help="measure index/__init__ + spawn-payload memory only (no decode) — for scaled "
+                    "parquet roots without matching video; the index is the term that scales/OOMs")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--num-batches", type=int, default=40)
@@ -114,11 +120,39 @@ def main():
         ds._rows = None
         gc.collect()
 
+    # spawn per-worker payload: the bytes each spawn worker receives (pickle applies the
+    # loader's __getstate__, so this is exactly what is shipped). With spawn this duplicates
+    # into every worker; with fork the parent's pages are COW-shared instead.
+    import pickle
+
+    spawn_payload_mb = len(pickle.dumps(ds, protocol=pickle.HIGHEST_PROTOCOL)) / _MB
+
+    if args.skip_iterate:
+        rows_mb = float("nan")
+        if getattr(ds, "_rows", None) is not None:
+            gc.collect()
+            before = proc.memory_info().rss
+            ds._rows = None
+            gc.collect()
+            rows_mb = (before - proc.memory_info().rss) / _MB
+        print(
+            f"MEM_RESULT side={args.side} ctx=index-only workers=0 frames={n_frames} "
+            f"init_index_mb={(rss_after_init - rss_before) / _MB:.0f} dead_rows_mb={rows_mb:.0f} "
+            f"spawn_payload_mb={spawn_payload_mb:.1f} per_frame_payload_bytes={spawn_payload_mb * _MB / max(1, n_frames):.0f}",
+            flush=True,
+        )
+        return
+
     # steady-state runtime RSS (main + workers) — measured with the dataset AS IT RUNS
     # (base keeps self._rows unless --free-base-rows; the Lance loaders free it in __init__),
     # so spawn workers carry exactly what the real loader would pickle to them.
+    sampler = None
+    if args.random:
+        g = torch.Generator().manual_seed(0)
+        sampler = torch.utils.data.RandomSampler(
+            ds, replacement=True, num_samples=(args.num_batches + args.warmup + 4) * args.batch_size, generator=g)
     loader = torch.utils.data.DataLoader(
-        ds, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=_collate,
+        ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, collate_fn=_collate,
         persistent_workers=args.num_workers > 0, prefetch_factor=4 if args.num_workers > 0 else None,
         multiprocessing_context=args.mp_context if args.num_workers > 0 else None,
     )
@@ -152,7 +186,8 @@ def main():
         f"MEM_RESULT side={args.side} ctx={args.mp_context} workers={args.num_workers} frames={n_frames} "
         f"init_index_mb={(rss_after_init - rss_before) / _MB:.0f} dead_rows_mb={rows_mb:.0f} "
         f"peak_rss_mb={peak_rss / _MB:.0f} peak_pss_mb={peak_pss / _MB:.0f} "
-        f"per_worker_rss_mb={per_worker_mb:.0f} per_worker_pss_mb={per_worker_pss_mb:.0f}",
+        f"per_worker_rss_mb={per_worker_mb:.0f} per_worker_pss_mb={per_worker_pss_mb:.0f} "
+        f"spawn_payload_mb={spawn_payload_mb:.1f}",
         flush=True,
     )
 
