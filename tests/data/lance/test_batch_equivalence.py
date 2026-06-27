@@ -24,7 +24,7 @@ import pytest
 import torch
 
 _BATCH = [0, 1, 123, 5000, 17000, 26000]
-_VMAD = 0.05  # mean |Δ|/255 tolerance for re-encoded video
+_VMAD = 0.02  # mean |Δ|/255 gate for the one offline H.264 re-encode (measured: composed ~1.5%, vsft ~1.3%)
 
 
 def _video_mad(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -49,6 +49,7 @@ def test_action_composed_batch_matches_base():
     idxs = [i for i in _BATCH if i < len(base)]
     batch = lance.__getitems__(idxs)  # the DataLoader hot path
     assert len(batch) == len(idxs)
+    mads = []
     for j, i in enumerate(idxs):
         b, l = base[i], batch[j]
         assert b.keys() == l.keys()
@@ -57,7 +58,12 @@ def test_action_composed_batch_matches_base():
         assert b["ai_caption"] == l["ai_caption"]
         assert b["video"].shape == l["video"].shape
         mad = _video_mad(b["video"], l["video"])
+        mads.append(mad)
         assert mad < _VMAD, f"video mean|Δ|/255={mad:.4f} at {i} exceeds {_VMAD}"
+    # assurance: the composed loader's video stays within the documented ~1.5% re-encode loss
+    batch_mad = sum(mads) / len(mads)
+    print(f"\n[composed action] batch mean|Δ|/255 = {batch_mad * 100:.2f}% (gate {_VMAD * 100:.0f}%)")
+    assert batch_mad < _VMAD
 
 
 @pytest.mark.skipif(not (_AROOT and _ARAW and os.path.isdir(_AROOT)),
@@ -85,20 +91,22 @@ _VKW = dict(num_video_frames=16, frame_selection_mode="first", temporal_interval
 @pytest.mark.skipif(not (_VJSONL and _VURI and os.path.isfile(_VJSONL)),
                     reason="set BRIDGE_JSONL + VISION_SFT_LANCE_URI")
 def test_vision_sft_batch_matches_base():
-    from cosmos_framework.data.lance import LanceVisionSFTDataset
-    from cosmos_framework.data.vfm.local_datasets.sft_local_dataset import LocalSFTDataset
+    from test_vision_sft_equivalence import _genuine_sftdataset_and_metas  # sibling helper
 
-    base = LocalSFTDataset(_VJSONL, **_VKW)
+    from cosmos_framework.data.lance import LanceVisionSFTDataset
+
+    base, metas = _genuine_sftdataset_and_metas(_VJSONL)  # the GENUINE shipped SFTDataset
     lance = LanceVisionSFTDataset(_VURI, table="vision_sft", decode_device="cpu", **_VKW)
-    idxs = [i for i in [0, 1, 17, 50, 123] if i < len(base)]
+    idxs = [i for i in [0, 1, 17, 50, 123] if i < len(lance)]
     batch = lance.__getitems__(idxs)
     assert len(batch) == len(idxs)
     for j, i in enumerate(idxs):
-        b, l = base[i], batch[j]
-        assert torch.equal(b["text_token_ids"], l["text_token_ids"]), f"token ids differ at {i}"
-        assert b["ai_caption"] == l["ai_caption"]
-        assert b["video"].shape == l["video"].shape
-        assert _video_mad(b["video"], l["video"]) < _VMAD
+        ref, l = base.process_one_sample(metas[i]), batch[j]
+        assert ref is not None
+        assert torch.equal(ref["text_token_ids"], l["text_token_ids"]), f"token ids differ at {i}"
+        assert ref["ai_caption"] == l["ai_caption"]
+        assert ref["video"].shape == l["video"].shape
+        assert _video_mad(ref["video"], l["video"]) < _VMAD
 
 
 # ── VLM: records byte-identical ──

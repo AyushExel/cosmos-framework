@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 """LanceDB-backed local vision-SFT (video+caption) dataset.
 
-A drop-in alternative to the local ``LocalSFTDataset`` (the faithful map-style
-representative of cosmos ``SFTDataset``). Instead of seeking the source mp4 on
-disk and resizing it per sample, it decodes a **pre-resized, short-GOP** per-clip
-mp4 from a Lance blob-v2 column and tokenizes the same caption.
+A drop-in alternative to the shipped ``SFTDataset`` (`sft_dataset.py`). Instead of
+downloading the source mp4 and resizing it per sample with ffmpeg, it decodes a
+**pre-resized, short-GOP** per-clip mp4 from a Lance column and tokenizes the same
+caption — reusing the base's own ``_select_caption`` + ``get_aspect_ratio`` so output
+matches ``SFTDataset.process_one_sample`` (token-ids exact, video within re-encode tol).
 
 Built by ``tools/lance_datagen/build_vision_sft.py``: each clip is decoded once,
 resized to the training resolution (the base loader's exact resize op), and
@@ -33,7 +34,7 @@ import numpy as np
 import torch
 from torchcodec.decoders import VideoDecoder
 
-from cosmos_framework.data.vfm.local_datasets.sft_local_dataset import select_caption
+from cosmos_framework.data.vfm.local_datasets.sft_dataset import _select_caption
 
 _MAX_CAPTION_TOKENS = 1024
 _META_COLS = [
@@ -53,7 +54,7 @@ def _resolve_device(device: str | None) -> torch.device | None:
 class LanceVisionSFTDataset(torch.utils.data.Dataset):
     """Map-style local vision-SFT loader backed by a Lance blob-v2 video table.
 
-    Output dict matches ``LocalSFTDataset.__getitem__`` (``video`` uint8 C,T,H,W;
+    Output dict matches ``SFTDataset.process_one_sample`` (``video`` uint8 C,T,H,W;
     ``text_token_ids``; SFT metadata). Worker-safe: only connection params are
     pickled; each worker reopens its own lance handle + decoder cache."""
 
@@ -188,7 +189,7 @@ class LanceVisionSFTDataset(torch.utils.data.Dataset):
         )
         return ids[: self.max_caption_tokens]
 
-    # ── window math (identical to LocalSFTDataset) ────────────────────
+    # ── window math (identical to SFTDataset.process_one_sample) ────────────────────
     def _window_plan(self, meta: dict) -> tuple[int, int, int]:
         """Return (start_frame, end_frame, temporal_interval) within the stored clip.
 
@@ -251,7 +252,8 @@ class LanceVisionSFTDataset(torch.utils.data.Dataset):
             crop_y = round((r["enc_h"] - target_h) / 2)
             crop_x = round((r["enc_w"] - target_w) / 2)
 
-            caption_key, caption, _ = select_caption(self._window_dict(r))
+            sel = _select_caption(self._window_dict(r)) or ("caption", "", False)
+            caption_key, caption, _ = sel
             specs.append(
                 {
                     "row": row, "clip_id": r["clip_id"], "fps": r["fps"],
@@ -316,10 +318,10 @@ class LanceVisionSFTDataset(torch.utils.data.Dataset):
 
         ``enc_h/enc_w`` is the resize-ratio size; the crop target is the
         ``VIDEO_RES_SIZE_INFO`` bucket for the original aspect ratio."""
-        from cosmos_framework.data.vfm.local_datasets.sft_local_dataset import _get_aspect_ratio
+        from cosmos_framework.data.vfm.local_datasets.helper import get_aspect_ratio
         from cosmos_framework.data.vfm.utils import VIDEO_RES_SIZE_INFO
 
-        ar = _get_aspect_ratio(r["width"], r["height"])
+        ar = get_aspect_ratio(r["width"], r["height"])
         # resolution bucket inferred from enc size: the stored clip was resized so
         # that max(target_w/in_w, target_h/in_h); recover target from the bucket that
         # the converter used. We carry resolution implicitly via the bucket lookup at
