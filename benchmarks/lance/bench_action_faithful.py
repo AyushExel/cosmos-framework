@@ -87,7 +87,8 @@ def _measure(ds, sampler_kind, *, batch_size, num_workers, num_batches, warmup):
               persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None,
               multiprocessing_context="spawn" if num_workers > 0 else None)
     if sampler_kind == "random":
-        g = torch.Generator(); g.manual_seed(0)
+        g = torch.Generator()
+        g.manual_seed(0)
         loader = torch.utils.data.DataLoader(ds, sampler=torch.utils.data.RandomSampler(ds, generator=g), **kw)
     else:
         loader = torch.utils.data.DataLoader(ds, **kw)  # IterableDataset (episode-shuffle)

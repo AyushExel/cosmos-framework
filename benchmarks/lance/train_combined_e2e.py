@@ -9,7 +9,7 @@ throughput + the GPU data-wait fraction.
 Why a sized transformer and not the exact Cosmos model: Cosmos's combined path
 (`IterativeJointDataLoader` → omni Mixture-of-Transformers) packs every modality into
 one token sequence and trains a transformer over it. The omni model is an 8B FSDP job;
-running it would only re-confirm "compute-bound on this GPU". Instead we keep the DATA
+running it would only re-confirm "compute-bound on this GPU". Instead, the bench keeps the DATA
 path 100% real (the actual base/lance sub-loaders + ratio mixing) and make the per-step
 COMPUTE a transformer over a fixed packed-token budget, sized by --layers/--dim/--seq.
 Sweeping --layers traces the data-bound → compute-bound crossover: where the dataloader
@@ -139,7 +139,10 @@ def main():
     last = None
     for step in range(args.steps + args.warmup):
         if step == args.warmup:
-            torch.cuda.synchronize(); t0 = time.perf_counter(); t_data = 0.0; seen = 0
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            t_data = 0.0
+            seen = 0
         sel = sched[step % len(sched)]
         if last is not None:
             pass
@@ -153,7 +156,9 @@ def main():
         tokens = torch.randint(0, 4096, (args.batch_size, args.seq), generator=g).to(dev)
         out = model(tokens)
         loss = out.float().log_softmax(-1).mean()
-        loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     print(f"    steps/s={args.steps / wall:6.2f}  samples/s={seen / wall:8.1f}  "
