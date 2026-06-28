@@ -84,7 +84,10 @@ class LanceDROIDDataset(_FreeBaseRowsMixin, DROIDLeRobotDataset):
         if self._decoders is not None:
             return
         so = self._storage_options
-        self._db = lancedb.connect(self._lance_uri, storage_options=so) if so else lancedb.connect(self._lance_uri)
+        if so:
+            self._db = lancedb.connect(self._lance_uri, storage_options=so)
+        else:
+            self._db = lancedb.connect(self._lance_uri)
         frames_table = self._db.open_table(self._frames_name)
         self._frames_perm = Permutation.identity(frames_table).with_format("arrow")
         self._videos_dataset = lance.dataset(
@@ -107,7 +110,10 @@ class LanceDROIDDataset(_FreeBaseRowsMixin, DROIDLeRobotDataset):
             blob = self._videos_dataset.take_blobs(blob_column="video_bytes", indices=[row])[0]
             data = blob.readall()
             blob.close()
-            dec = VideoDecoder(data, device=str(self._decode_device) if self._decode_device else None)
+            if self._decode_device:
+                dec = VideoDecoder(data, device=str(self._decode_device))
+            else:
+                dec = VideoDecoder(data)
             if len(self._decoders) >= self._decoder_cache_size:
                 self._decoders.pop(next(iter(self._decoders)))
             self._decoders[key] = dec
