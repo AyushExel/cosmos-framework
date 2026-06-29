@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import torch
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from cosmos_framework.model.attention import (
     attention,
@@ -10,6 +11,8 @@ from cosmos_framework.model.attention import (
 )
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.vfm.utils.memory import KVToStore, MemoryValue
+
+flex_attention = torch.compile(flex_attention)
 
 
 class SplitInfo:
@@ -27,8 +30,8 @@ class SplitInfo:
     ):
         """
         Actual len is the actual non-padded length of the packed sequence.
-        It's used to trim split_lens, attn_modes and sample_lens, which may
-        be padded to max sequence length by upstream packers.
+        It's used to trim split_lens, attn_modes and sample_lens, which were
+        originally padded to max sequence length (likely for flex attention).
         """
         assert sum(sample_lens) == sum(split_lens), (
             f"Sum of new sample lens {sum(sample_lens)} is not equal to sum of new split lens {sum(split_lens)}"
@@ -57,31 +60,33 @@ class SplitInfo:
         self.null_action_supertokens = null_action_supertokens
 
 
-AttentionMaskType = SplitInfo
+AttentionMaskType = BlockMask | SplitInfo
 
 
 _dotproduct_attention_cache = {}
 
 
-from cosmos_framework.data.vfm.sequence_packing.natten import (
+from cosmos_framework.data.vfm.sequence_packing import (
+    FactoredSequencePack,
+    JointSequencePack,
+    create_sparse_mask,
+    factored_from_joint_sequence,
+    from_joint,
+    from_mode_splits,
     generate_natten_metadata,
     generate_temporal_causal_natten_metadata,
-)
-from cosmos_framework.data.vfm.sequence_packing.runtime import (
-    SequencePack,
-    from_mode_splits,
     get_all_seq,
     get_causal_seq,
     get_full_only_seq,
-    sequence_pack_from_packed_sequence,
+    joint_from_joint_sequence,
 )
 
 
 def two_way_attention(
-    packed_query_states: SequencePack,
-    packed_key_states: SequencePack,
-    packed_value_states: SequencePack,
-) -> SequencePack:
+    packed_query_states: FactoredSequencePack | JointSequencePack,
+    packed_key_states: FactoredSequencePack | JointSequencePack,
+    packed_value_states: FactoredSequencePack | JointSequencePack,
+):
     """
     Performs two-way attention with causal and full attention.
     """
@@ -129,12 +134,12 @@ def two_way_attention(
 
 
 def three_way_attention(
-    packed_query_states: SequencePack,
-    packed_key_states: SequencePack,
-    packed_value_states: SequencePack,
+    packed_query_states: FactoredSequencePack | JointSequencePack,
+    packed_key_states: FactoredSequencePack | JointSequencePack,
+    packed_value_states: FactoredSequencePack | JointSequencePack,
     natten_metadata: dict | None,
     attention_meta: SplitInfo | None = None,
-) -> SequencePack:
+):
     """
     Performs three-way attention, with understanding and generations attentions fully decomposed,
     and allows sparsity / multi-dimensional masking in the generation tower.
@@ -233,14 +238,72 @@ def three_way_attention(
     return out_all
 
 
+def pad_sequence(tensor, pad_size):
+    """
+    Pad a tensor along the second-to-last dimension.
+
+    Args:
+        tensor: Input tensor to pad
+        pad_size: Number of padding elements to add
+
+    Returns:
+        Padded tensor with zeros added along dim=-2
+    """
+    if pad_size <= 0:
+        return tensor
+    pad_shape = list(tensor.shape)
+    pad_shape[-2] = pad_size
+    padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([tensor, padding], dim=-2)  # [...,S+pad_size,...]
+
+
+def block_flex_attention(
+    packed_query_states: FactoredSequencePack | JointSequencePack,
+    packed_key_states: FactoredSequencePack | JointSequencePack,
+    packed_value_states: FactoredSequencePack | JointSequencePack,
+    attention_mask: BlockMask,
+    block_size: int | None = None,
+):
+    packed_queries = get_all_seq(packed_query_states)  # [N,heads,head_dim]
+    packed_keys = get_all_seq(packed_key_states)  # [N,heads,head_dim]
+    packed_values = get_all_seq(packed_value_states)  # [N,heads,head_dim]
+    max_num_tokens = packed_query_states["max_num_tokens"]
+
+    num_attention_heads = packed_queries.shape[1]
+    head_dim = packed_queries.shape[2]
+
+    # Handle block mask attention with flex_attention
+    pad_size = max_num_tokens - packed_queries.shape[0]
+    packed_queries_padded = pad_sequence(packed_queries.permute(1, 0, 2), pad_size)  # [heads,max_num_tokens,head_dim]
+    packed_keys_padded = pad_sequence(packed_keys.permute(1, 0, 2), pad_size)  # [heads,max_num_tokens,head_dim]
+    packed_values_padded = pad_sequence(packed_values.permute(1, 0, 2), pad_size)  # [heads,max_num_tokens,head_dim]
+
+    packed_attn_output = flex_attention(
+        packed_queries_padded.unsqueeze(0),  # [1,heads,max_num_tokens,head_dim]
+        packed_keys_padded.unsqueeze(0),  # [1,heads,max_num_tokens,head_dim]
+        packed_values_padded.unsqueeze(0),  # [1,heads,max_num_tokens,head_dim]
+        enable_gqa=True,
+        block_mask=attention_mask,
+    )  # [1,heads,max_num_tokens,head_dim]
+    assert isinstance(packed_attn_output, torch.Tensor)
+
+    end_index = packed_attn_output.shape[2] - pad_size
+    packed_attn_output = packed_attn_output[0, :, :end_index, :]  # [heads,N,head_dim]
+    packed_attn_output = packed_attn_output.transpose(0, 1).reshape(
+        -1, num_attention_heads * head_dim
+    )  # [N,heads*head_dim]
+
+    return from_joint(packed_attn_output, packed_query_states)
+
+
 def dispatch_attention(
-    packed_query_states: SequencePack,
-    packed_key_states: SequencePack,
-    packed_value_states: SequencePack,
-    attention_mask: SplitInfo,
+    packed_query_states: FactoredSequencePack | JointSequencePack,
+    packed_key_states: FactoredSequencePack | JointSequencePack,
+    packed_value_states: FactoredSequencePack | JointSequencePack,
+    attention_mask: BlockMask | SplitInfo,
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
-) -> tuple[SequencePack, KVToStore | None]:
+) -> tuple[FactoredSequencePack | JointSequencePack, KVToStore | None]:
     assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
     if isinstance(attention_mask, SplitInfo) and attention_mask.is_three_way:
         output = three_way_attention(
@@ -253,7 +316,7 @@ def dispatch_attention(
     elif isinstance(attention_mask, SplitInfo):
         output = two_way_attention(packed_query_states, packed_key_states, packed_value_states)
     else:
-        raise TypeError(f"Unsupported attention metadata: {type(attention_mask)}")
+        output = block_flex_attention(packed_query_states, packed_key_states, packed_value_states, attention_mask)
     return output, None
 
 
@@ -281,21 +344,35 @@ def build_packed_sequence(
     num_action_tokens_per_supertoken: int = 0,
     null_action_supertokens: bool = False,
     pad_for_cuda_graphs: bool = False,
-) -> tuple[SequencePack, AttentionMaskType, list | None]:
+) -> tuple[FactoredSequencePack | JointSequencePack, AttentionMaskType, list | None]:
     """
     Build the model input pack and attention meta for joint attention.
     Returns a tuple: (input_pack, attention_meta).
     """
     device = packed_sequence.device
     natten_metadata_list = None
-    if joint_attn_implementation == "two_way":
+    if joint_attn_implementation == "flex":
+        sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
+        seqlen = sum(sample_lens)
+        attention_meta = create_block_mask(
+            sparse_mask,
+            B=1,
+            H=num_heads,
+            Q_LEN=seqlen,
+            KV_LEN=seqlen,
+            device=device,
+            BLOCK_SIZE=block_size,
+            _compile=True,
+        )
+        make_pack = joint_from_joint_sequence
+    elif joint_attn_implementation == "two_way":
         attention_meta = SplitInfo(
             split_lens=split_lens,
             attn_modes=attn_modes,
             sample_lens=sample_lens,
             actual_len=int(packed_sequence.shape[0]),
         )
-        make_pack = sequence_pack_from_packed_sequence
+        make_pack = factored_from_joint_sequence
     elif joint_attn_implementation == "three_way":
         attention_meta = SplitInfo(
             split_lens=split_lens,
@@ -308,7 +385,7 @@ def build_packed_sequence(
             num_action_tokens_per_supertoken=num_action_tokens_per_supertoken,
             null_action_supertokens=null_action_supertokens,
         )
-        make_pack = sequence_pack_from_packed_sequence
+        make_pack = factored_from_joint_sequence
         # Some memory-driven attention paths implement temporal visibility in
         # their own attention kernels; skip NATTEN metadata for those paths.
         if not skip_natten_metadata:
@@ -335,7 +412,8 @@ def build_packed_sequence(
                 )
     else:
         raise ValueError(
-            f"Invalid joint_attn_implementation: {joint_attn_implementation}. Must be 'two_way' or 'three_way'."
+            f"Invalid joint_attn_implementation: {joint_attn_implementation}. "
+            "Must be 'two_way', 'three_way', or 'flex'."
         )
 
     input_pack = make_pack(

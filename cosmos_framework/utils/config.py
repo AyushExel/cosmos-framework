@@ -517,12 +517,7 @@ class Config:
         assert self.job.name != ""
 
 
-def load_config(
-    config_path: str,
-    opts: list[str],
-    enable_one_logger: bool = False,
-) -> Config:
-    """Load a config from a ``.yaml`` or ``.py`` path and apply ``opts``."""
+def load_config(config_path: str, opts: list[str], enable_one_logger: bool = False) -> Config:
     from cosmos_framework.utils.serialization import from_yaml, load_callable
 
     t1 = time.monotonic_ns()
@@ -554,11 +549,7 @@ def load_config(
     return config
 
 
-def _load_py_config(
-    config_path: str,
-    opts: list[str],
-    validate: bool = True,
-) -> Config:
+def _load_py_config(config_path: str, opts: list[str], validate: bool = True) -> Config:
     # NOTE: circular dependency
     from cosmos_framework.utils.config_helper import get_config_module, override
 
