@@ -487,6 +487,8 @@ class Rank0FIDMetric(nn.Module):
             self._fid_metric.reset()
 
 
+
+
 __all__ = [
     "TokenizerMetric",
     "PSNRMetric",

@@ -8,11 +8,11 @@ mirrors ``vision_sft_nano`` (HF-cluster deployment with empty tokenizer/vlm
 paths, video-style loss scales, ``load_weights_from_pretrained=True``).
 """
 
-from cosmos_framework.configs.base.defaults.vlm import (
+from cosmos_framework.configs.base.defaults.reasoner import (
     create_qwen2_tokenizer_with_download,
     create_vlm_config,
 )
-from cosmos_framework.model.vfm.mot.unified_mot import Qwen3VLMoTConfig, Qwen3VLTextForCausalLM
+from cosmos_framework.model.generator.mot.unified_mot import Qwen3VLMoTConfig, Qwen3VLTextForCausalLM
 from cosmos_framework.utils.lazy_config import LazyCall as L
 
 NANO_MODEL_CONFIG = dict(
@@ -40,10 +40,6 @@ NANO_MODEL_CONFIG = dict(
         load_weights_from_pretrained=True,
         max_vae_latent_side_after_patchify=20,
         patch_spatial=2,
-        position_embedding_type="unified_3d_mrope",
-        rope_h_extrapolation_ratio=1.0,
-        rope_t_extrapolation_ratio=1.0,
-        rope_w_extrapolation_ratio=1.0,
         timestep_range=1.0,
         unified_3d_mrope_reset_spatial_ids=True,
         unified_3d_mrope_temporal_modality_margin=15000,
@@ -85,9 +81,6 @@ NANO_MODEL_CONFIG = dict(
     ),
     rectified_flow_training_config=dict(
         action_loss_weight=10.0,
-        high_sigma_ratio=0.05,
-        high_sigma_timesteps_max=1000,
-        high_sigma_timesteps_min=995,
         image_loss_scale=1.0,
         independent_action_schedule=False,
         loss_scale=1.0,
@@ -100,8 +93,6 @@ NANO_MODEL_CONFIG = dict(
         train_time_weight="uniform",
         use_discrete_rf=False,
         use_dynamic_shift=False,
-        use_high_sigma_strategy=False,
-        use_high_sigma_strategy_action=False,
     ),
     tokenizer=dict(
         bucket_name="",
@@ -133,7 +124,7 @@ NANO_MODEL_CONFIG = dict(
             config=L(create_vlm_config)(
                 base_config=L(Qwen3VLMoTConfig.from_json_file)(
                     json_file=(
-                        "cosmos_framework/model/vfm/vlm/qwen3_vl/configs/"
+                        "cosmos_framework/model/generator/reasoner/qwen3_vl/configs/"
                         "Qwen3-VL-8B-Instruct.json"
                     ),
                 ),

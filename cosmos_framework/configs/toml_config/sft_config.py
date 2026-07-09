@@ -39,7 +39,7 @@ class JobConfig(BaseModel):
         description=(
             "META — chooses which make_config() to call: "
             "'vfm' → cosmos_framework/configs/base/config.py (video foundation model), "
-            "'vlm' → cosmos_framework/configs/base/vlm/config.py (vision-language model). "
+            "'vlm' → cosmos_framework/configs/base/reasoner/config.py (vision-language model). "
             "Also picks the path-remap rules in toml_config_helper.PATH_REMAPS."
         ),
     )
@@ -81,6 +81,17 @@ class JobConfig(BaseModel):
             "Wandb upload mode: 'online' (real-time, needs WANDB_API_KEY), "
             "'offline' (log locally, sync later with `wandb sync`), or "
             "'disabled' (no wandb at all)."
+        ),
+    )
+    upload_reproducible_setup: bool = Field(
+        default=False,
+        description=(
+            "Upload the reproducible-setup bundle and wandb save_s3 artifacts "
+            "to S3. Defaults False (OSS: no S3 access). Set True only when S3 "
+            "upload is configured. Remapped out of [job] to the top-level "
+            "config.upload_reproducible_setup, overriding the base config value "
+            "(the VLM base defaults it True). Always emitted by "
+            "load_experiment_from_toml, so omitting it forces False."
         ),
     )
 
@@ -669,6 +680,15 @@ class SFTExperimentConfig(BaseModel):
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     dataloader_train: DataloaderTrainConfig = Field(default_factory=DataloaderTrainConfig)
+    custom: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Free-form, project-owned escape hatch. Arbitrary nested content "
+            "passes through verbatim — the framework never validates inside it. "
+            "Injected onto the loaded config as ``config.custom`` after Hydra "
+            "resolution; specify concrete values here (no ${...} interpolation)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +703,7 @@ def load_experiment_from_toml(
     The base config module is picked from ``[job].task`` in the TOML:
 
     - ``task = "vfm"`` → ``cosmos_framework/configs/base/config.py``
-    - ``task = "vlm"`` → ``cosmos_framework/configs/base/vlm/config.py``
+    - ``task = "vlm"`` → ``cosmos_framework/configs/base/reasoner/config.py``
 
     ``extra_overrides`` is appended after the TOML-derived Hydra overrides, so
     command-line entries take precedence over TOML values. Each entry must be
@@ -693,16 +713,17 @@ def load_experiment_from_toml(
         ["optimizer.lr=1e-5", "trainer.max_iter=200"]
         ["model.config.parallelism.data_parallel_shard_degree=4"]
 
-    Calls ``cosmos_framework.utils.config.load_config`` which:
+    The load then:
 
-    1. Imports the base config module and runs ``make_config()``. This
-       registers every config group (model, ema, tokenizer, ...) and imports
-       all experiment modules so their ``cs.store(group="experiment", ...)``
-       side-effects fire.
-    2. Runs ``override(config, overrides)`` — Hydra ``compose`` then resolves
-       the ``experiment=<name>`` selector against ``ConfigStore`` and applies
-       the dotted-path overrides we generated from the TOML, followed by
-       ``extra_overrides``.
+    1. Runs ``load_config`` — imports the base config module, runs
+       ``make_config()`` (registers config groups + experiment modules), and
+       lets Hydra ``compose`` resolve the ``experiment=<name>`` selector and
+       apply the dotted-path overrides, followed by ``extra_overrides``.
+    2. Injects the TOML's ``[custom]`` table (if any) verbatim onto
+       ``config.custom`` *after* loading — kept out of ``build_hydra_overrides``
+       so it lands as-is, not per-leaf-remapped. Because this happens after
+       Hydra resolution, ``[custom]`` must hold concrete values; ``${...}``
+       interpolation against ``custom`` is not supported.
 
     Returns the merged ``Config`` instance, ready for ``launch()``.
     """
@@ -711,7 +732,14 @@ def load_experiment_from_toml(
 
     # Validate structure against the pydantic schema (raises ValidationError on
     # unknown keys because of ``extra="forbid"``).
-    SFTExperimentConfig.model_validate(raw)
+    cfg = SFTExperimentConfig.model_validate(raw)
+
+    # ``build_hydra_overrides`` walks the *raw* dict, so an omitted field emits
+    # no override and the base config's value wins. ``upload_reproducible_setup``
+    # must instead default to False (OSS: no S3), overriding the VLM base's True.
+    # Inject the pydantic-resolved value back into raw so the override is always
+    # emitted — the default lives in exactly one place (JobConfig.Field).
+    raw.setdefault("job", {})["upload_reproducible_setup"] = cfg.job.upload_reproducible_setup
 
     task = raw.get("job", {}).get("task", "vfm")
     try:
@@ -740,4 +768,10 @@ def load_experiment_from_toml(
     # Import lazily so this module stays cheap to import in non-training contexts.
     from cosmos_framework.utils.config import load_config
 
-    return load_config(base_config_path, overrides)
+    config = load_config(base_config_path, overrides)
+
+    # Inject [custom] verbatim after Hydra resolution. Kept off the base config
+    # schema so the framework-owned hydra configs stay untouched; lands as a
+    # plain dict reachable via config.custom.
+    config.custom = raw.get("custom", {})
+    return config

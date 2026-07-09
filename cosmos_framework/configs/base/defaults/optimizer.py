@@ -8,7 +8,7 @@ from typing import Any
 from cosmos_framework.utils.lazy_config import PLACEHOLDER
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.config_helper import ConfigStore
-from cosmos_framework.utils.vfm.optimizer import build_lr_scheduler, build_optimizer
+from cosmos_framework.utils.generator.optimizer import build_lr_scheduler, build_optimizer
 
 OPTIMIZER_KWARGS: dict[str, Any] = dict(
     # Learning rate for the optimizer.
@@ -91,6 +91,23 @@ def register_schedulers(lambdacosine_kwargs: dict[str, Any]) -> None:
             optimizer=PLACEHOLDER,
             lr_scheduler_type="LambdaCosine",
             **lambdacosine_kwargs,
+        ),
+    )
+    # WSD (Warmup-Stable-Decay) scheduler for LLM pretraining
+    cs.store(
+        group="scheduler",
+        package="scheduler",
+        name="wsd",
+        node=L(build_lr_scheduler)(
+            optimizer=PLACEHOLDER,
+            lr_scheduler_type="wsd",
+            warm_up_steps=2000,
+            total_steps=50000,
+            decay_steps=5000,
+            decay_type="cosine",
+            f_start=0.01,
+            f_max=1.0,
+            f_min=0.1,
         ),
     )
 
